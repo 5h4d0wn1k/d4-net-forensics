@@ -2,7 +2,7 @@
 """
 D4 — Network Forensics Suite
 PCAP parsing, flow reconstruction, protocol analysis, IoC extraction.
-Uses scapy for packet parsing.
+Stdlib-only (struct-based PCAP/IP/Ethernet/TCP/UDP parser and generator).
 """
 
 import struct
@@ -61,7 +61,7 @@ class PCAPParser:
             print(f"[ERROR] Not a valid PCAP file (magic: 0x{magic:08x})")
             return False
 
-        _, _, _, _, _, self.link_type, _ = struct.unpack_from(endian + "IHHiiII", self.data, 0)
+        _, _, _, _, _, _, self.link_type = struct.unpack_from(endian + "IHHiiII", self.data, 0)
 
         offset = 24
         while offset < len(self.data) - 16:
@@ -292,7 +292,6 @@ class ProtocolAnalyzer:
                     self._parse_dns_query(pkt, payload)
                 elif sport == 53:
                     self._parse_dns_response(pkt, payload)
-
                 if dport in (80, 8080) and len(payload) > 20:
                     self._parse_http(pkt, payload)
 
@@ -314,7 +313,9 @@ class ProtocolAnalyzer:
         return 0
 
     def _parse_dns_query(self, pkt: dict, payload: bytes):
-        """Parse DNS query packet."""
+        """Parse DNS query packet (skips 8-byte UDP header when present)."""
+        if pkt.get("protocol") == "UDP" and len(payload) >= 8:
+            payload = payload[8:]
         if len(payload) < 12:
             return
         qdcount = struct.unpack_from(">H", payload, 4)[0]
@@ -322,17 +323,34 @@ class ProtocolAnalyzer:
             return
         offset = 12
         name = self._read_dns_name(payload, offset)
-        if name and offset + len(name) < len(payload):
-            qtype = struct.unpack_from(">H", payload, offset + len(name.split(".")[-1]) + 2)[0] if offset + len(name) + 4 <= len(payload) else 0
+        if name:
             self.dns_queries.append({
                 "timestamp": pkt["timestamp"].isoformat(),
                 "src_ip": pkt["src_ip"],
                 "query": name,
-                "type": self._dns_type_name(qtype),
+                "type": self._dns_type_name(self._dns_question_type(payload, name)),
             })
 
+    def _dns_question_type(self, payload: bytes, name: str) -> int:
+        """Return the QTYPE by scanning past the already-read name labels."""
+        offset = 12
+        while offset < len(payload):
+            length = payload[offset]
+            if length == 0:
+                offset += 1
+                break
+            if (length & 0xC0) == 0xC0:
+                offset += 2
+                break
+            offset += 1 + length
+        if offset + 4 <= len(payload):
+            return struct.unpack_from(">H", payload, offset)[0]
+        return 0
+
     def _parse_dns_response(self, pkt: dict, payload: bytes):
-        """Parse DNS response packet."""
+        """Parse DNS response packet (skips 8-byte UDP header when present)."""
+        if pkt.get("protocol") == "UDP" and len(payload) >= 8:
+            payload = payload[8:]
         if len(payload) < 12:
             return
         ancount = struct.unpack_from(">H", payload, 6)[0]
@@ -368,8 +386,10 @@ class ProtocolAnalyzer:
         return {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA"}.get(qtype, str(qtype))
 
     def _parse_http(self, pkt: dict, payload: bytes):
-        """Parse HTTP request from TCP payload."""
+        """Parse HTTP request from TCP payload (skips 20-byte TCP header)."""
         try:
+            if pkt.get("protocol") == "TCP" and len(payload) >= 20:
+                payload = payload[20:]
             text = payload.decode("ascii", errors="replace")
             lines = text.split("\r\n")
             if lines and " " in lines[0]:
@@ -737,39 +757,46 @@ class NetworkForensics:
         return output_path
 
     def _make_dns_packet(self, domain: str, ts: datetime, src_ip: str) -> dict:
-        """Create a synthetic DNS query packet."""
-        query = self._encode_dns_query(domain)
-        ip_payload = self._make_ip_header(src_ip, "8.8.8.8", 17, query)
+        """Create a synthetic DNS query packet (proper UDP header + DNS payload)."""
+        dns_payload = self._encode_dns_query(domain)
+        sport = 55333
+        dport = 53
+        udp_header = struct.pack(">HHHH", sport, dport, 8 + len(dns_payload), 0)
+        payload = udp_header + dns_payload
         return {
             "timestamp": ts,
             "src_ip": src_ip,
             "dst_ip": "8.8.8.8",
             "protocol": "UDP",
             "protocol_num": 17,
-            "total_length": len(ip_payload),
-            "payload": query,
-            "payload_hex": query.hex(),
+            "total_length": 20 + 8 + len(dns_payload),
+            "payload": payload,
+            "payload_hex": payload.hex(),
         }
 
     def _make_http_packet(self, method: str, uri: str, host: str, ts: datetime, src_ip: str) -> dict:
-        """Create a synthetic HTTP request packet."""
+        """Create a synthetic HTTP request packet (TCP header + HTTP payload)."""
         http = f"{method} {uri} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-        payload = http.encode("ascii")
-        ip_payload = self._make_ip_header(src_ip, "93.184.216.34", 6, payload)
+        app_data = http.encode("ascii")
+        sport = 50123
+        dport = 80
+        tcp_header = struct.pack(">HH", sport, dport) + b"\x00" * 16
+        payload = tcp_header + app_data
         return {
             "timestamp": ts,
             "src_ip": src_ip,
             "dst_ip": "93.184.216.34",
             "protocol": "TCP",
             "protocol_num": 6,
-            "total_length": len(ip_payload),
+            "total_length": 20 + 20 + len(app_data),
             "payload": payload,
             "payload_hex": payload.hex(),
         }
 
     def _make_tcp_packet(self, src_ip: str, dst_ip: str, dport: int, ts: datetime, payload: bytes) -> dict:
-        """Create a synthetic TCP packet."""
-        sport = 40000 + (hash((src_ip, dst_ip, dport)) % 10000)
+        """Create a synthetic TCP packet (TCP header + optional payload)."""
+        seed = (sum(src_ip.encode("ascii")) * 31 + sum(dst_ip.encode("ascii")) * 17 + dport) % 10000
+        sport = 40000 + seed
         tcp_header = struct.pack(">HH", sport, dport) + b"\x00" * 16
         return {
             "timestamp": ts,
@@ -777,7 +804,7 @@ class NetworkForensics:
             "dst_ip": dst_ip,
             "protocol": "TCP",
             "protocol_num": 6,
-            "total_length": 20 + len(payload),
+            "total_length": 20 + 20 + len(payload),
             "payload": tcp_header + payload,
             "payload_hex": (tcp_header + payload).hex(),
         }
@@ -791,14 +818,15 @@ class NetworkForensics:
         return ip + payload
 
     def _encode_dns_query(self, domain: str) -> bytes:
-        """Encode a domain name into DNS query format."""
+        """Encode a domain name into DNS query format (valid DNS header + question)."""
         parts = domain.split(".")
-        query = b""
+        name = b""
         for part in parts:
-            query += bytes([len(part)]) + part.encode("ascii")
-        query += b"\x00"
-        query += struct.pack(">HH", 1, 1)  # Type A, Class IN
-        return query
+            name += bytes([len(part)]) + part.encode("ascii")
+        name += b"\x00"
+        question = name + struct.pack(">HH", 1, 1)  # Type A, Class IN
+        header = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)  # ID, flags RD
+        return header + question
 
     def _write_pcap(self, packets: list, output_path: str):
         """Write packets to a PCAP file."""
@@ -825,25 +853,24 @@ class NetworkForensics:
                 f.write(pkt_data)
 
     def _raw_packet(self, pkt: dict) -> bytes:
-        """Create raw packet bytes from packet dict with Ethernet header."""
-        src_mac = b"\x00" * 6
-        dst_mac = b"\x00" * 6
+        """Create raw packet bytes from packet dict with Ethernet + IPv4 + transport header."""
+        src_mac = b"\x00\x01\x02\x03\x04\x05"
+        dst_mac = b"\x06\x07\x08\x09\x0a\x0b"
         eth_type = struct.pack(">H", 0x0800)  # IPv4
 
         src_ip = bytes(int(x) for x in pkt["src_ip"].split("."))
         dst_ip = bytes(int(x) for x in pkt["dst_ip"].split("."))
 
         protocol = pkt.get("protocol_num", 6)
-        if protocol == 17:
-            total_len = 20 + 8 + len(pkt.get("payload", b""))
-        else:
-            total_len = 20 + len(pkt.get("payload", b""))
+        transport = pkt.get("payload", b"")
+        # transport already includes TCP/UDP header from the _make_* builders
+        total_len = 20 + len(transport)
 
         ip_header = struct.pack(">BBHHHBB", 0x45, 0, total_len, 0, 0, 64, protocol)
         ip_header += b"\x00\x00"
         ip_header += src_ip + dst_ip
 
-        return dst_mac + src_mac + eth_type + ip_header + pkt.get("payload", b"")
+        return dst_mac + src_mac + eth_type + ip_header + transport
 
 
 def main():
@@ -861,7 +888,28 @@ def main():
     parser.add_argument("--flows", "-f", action="store_true", help="Show flows only")
     parser.add_argument("--dns", action="store_true", help="Show DNS queries only")
     parser.add_argument("--iocs", action="store_true", help="Extract IoCs only")
+    parser.add_argument("--demo", action="store_true", help="Run against the bundled fixture")
     args = parser.parse_args()
+
+    if args.demo:
+        base = os.path.dirname(os.path.abspath(sys.argv[0]))
+        if os.path.basename(base) == "firmware":
+            base = os.path.dirname(base)
+        fixture = os.path.join(base, "tests", "fixtures", "network_traffic.pcap")
+        if not os.path.isfile(fixture):
+            print("[ERROR] Fixture not found: %s" % fixture)
+            sys.exit(1)
+        forensics = NetworkForensics(fixture)
+        if not forensics.load():
+            sys.exit(1)
+        result = forensics.full_analysis()
+        out_dir = os.path.join(base, "reports")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "d4_report.json")
+        with open(out_path, "w") as f:
+            json.dump(result, f, indent=2, default=str)
+        print("\nReport written to %s" % out_path)
+        return
 
     if args.generate_test:
         forensics = NetworkForensics(args.generate_test)
